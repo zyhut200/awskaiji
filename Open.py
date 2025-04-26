@@ -681,44 +681,98 @@ def launch_ec2_instance(access_key, secret_key, proxy_url, country_code=None):
     finally:
         socket.socket = original_socket
 
+def fetch_proxy_from_country(country_code=None):
+    """获取指定国家的代理，如未指定则随机选择，并重置全局状态"""
+    global last_used_country
+    random_session = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+    country_codes = ['BR', 'GB', 'DK', 'DE', 'FR', 'ES', 'IL', 'AT', 'GE', 'NG', 'AM', 'PK', 'ML', 'NL', 'LB', 'AR',
+                     'KW', 'VN', 'TZ', 'OM', 'TR', 'GE', 'BA', 'LK', 'MA', 'AM', 'PE', 'CO', 'KG', 'RS', 'SK', 'TJ',
+                     'AZ', 'AG', 'BG', 'LA', 'CG', 'EG', 'ET', 'MD', 'FI', 'PH', 'ZA', 'IE', 'GH', 'JM', 'GT', 'PE',
+                     'HU', 'JP', 'LV', 'CZ', 'MU', 'NO', 'GY']
+
+    with used_country_lock:
+        if country_code is None:
+            # 确保不重复使用上一次的国家
+            available_countries = [c for c in country_codes if c != last_used_country]
+            country_code = random.choice(available_countries)
+            last_used_country = country_code
+        else:
+            last_used_country = country_code
+
+    proxy_user = f"accountId-4259-tunnelId-6084-area-{country_code}-sessID-{random_session}-sessTime-10"
+    proxy_pass = "0giZQF"
+    proxy_url = f"http://{proxy_user}:{proxy_pass}@proxyas.starryproxy.com:10000"
+    logger.info(f"获取新代理: 国家={country_code}, URL={proxy_url}")
+    return proxy_url, country_code
+
+
 def process_account(access_key, secret_key, max_retries=3):
-        """处理单个账号，包含重试逻辑"""
-        global success_counter, failure_counter
-        display_key = format_access_key(access_key)
-        retry_count = 0
-        proxy_ip = "未知"  # 初始化proxy_ip变量
+    """处理单个账号，包含代理和AWS API重试逻辑"""
+    global success_counter, failure_counter
+    display_key = format_access_key(access_key)
+    retry_count = 0
+    proxy_ip = "未知"
 
-        while retry_count <= max_retries:
-            proxy_url, current_country_code = fetch_proxy_from_country(None)  # 强制每次新国家
-            logger.info(f"{display_key} = 获取代理: 国家={current_country_code}")
+    # 在开始处理时获取一个新代理
+    proxy_url, current_country_code = fetch_proxy_from_country(None)
+    logger.info(f"{display_key} = 初始代理: 国家={current_country_code}")
 
-            try:
-                success, message, country_code, current_proxy_ip = launch_ec2_instance(access_key, secret_key, proxy_url, current_country_code)
-                proxy_ip = current_proxy_ip  # 更新proxy_ip
-                if success:
-                    with counter_lock:
-                        success_counter += 1
-                    return True, proxy_ip
-                if "代理" in message or "proxy" in message.lower():
-                    logger.info(f"{display_key} = 代理问题，准备第 {retry_count + 1} 次重试")
-                    retry_count += 1
-                    time.sleep(random.uniform(10, 20))
-                else:
-                    with counter_lock:
-                        failure_counter += 1
-                    return False, proxy_ip
-            except Exception as e:
-                logger.error(f"{display_key} = 处理出错: {str(e)}")
+    while retry_count < max_retries:
+        # 测试当前代理
+        user_agent = get_random_user_agent()
+        proxy_ok, proxy_msg = test_proxy_connection(proxy_url, user_agent)
+        if not proxy_ok:
+            logger.info(f"{display_key} = 代理测试失败: {proxy_msg}")
+            retry_count += 1
+            if retry_count < max_retries:
+                logger.info(f"{display_key} = 代理问题，准备第 {retry_count + 1} 次重试")
+                # 获取新代理
+                proxy_url, current_country_code = fetch_proxy_from_country(None)
+                logger.info(f"{display_key} = 获取新代理: 国家={current_country_code}")
+                time.sleep(random.uniform(5, 10))
+            continue
+
+        try:
+            logger.info(f"{display_key} = 调用 launch_ec2_instance: proxy_url={proxy_url}, country_code={current_country_code}")
+            success, message, country_code, current_proxy_ip = launch_ec2_instance(
+                access_key, secret_key, proxy_url, current_country_code
+            )
+            proxy_ip = current_proxy_ip
+            if success:
+                with counter_lock:
+                    success_counter += 1
+                logger.info(f"{display_key} = 启动成功，代理IP={proxy_ip}")
+                return True, proxy_ip
+            # 区分错误类型
+            if "代理" in message or "proxy" in message.lower() or "RequestTimeout" in message or "ConnectionError" in message:
+                logger.info(f"{display_key} = 代理问题，准备第 {retry_count + 1} 次重试")
                 retry_count += 1
-                time.sleep(random.uniform(10, 20))
+                if retry_count < max_retries:
+                    # 获取新代理
+                    proxy_url, current_country_code = fetch_proxy_from_country(None)
+                    logger.info(f"{display_key} = 获取新代理: 国家={current_country_code}")
+                    time.sleep(random.uniform(5, 10))
+            else:
+                # 非代理相关错误，直接标记为失败
+                logger.error(f"{display_key} = 非代理错误，停止重试: {message}")
+                with counter_lock:
+                    failure_counter += 1
+                return False, proxy_ip
+        except Exception as e:
+            logger.error(f"{display_key} = 处理出错: {str(e)}")
+            retry_count += 1
+            if retry_count < max_retries:
+                # 获取新代理
+                proxy_url, current_country_code = fetch_proxy_from_country(None)
+                logger.info(f"{display_key} = 获取新代理: 国家={current_country_code}")
+                time.sleep(random.uniform(5, 10))
 
-        # 达到最大重试次数
-        with counter_lock:
-            failure_counter += 1
-        logger.error(f"{display_key} = 达到最大重试次数 ({max_retries})")
-        return False, proxy_ip
+    # 达到最大重试次数
+    with counter_lock:
+        failure_counter += 1
+    logger.error(f"{display_key} = 达到最大重试次数 ({max_retries})")
+    return False, proxy_ip
 
-from collections import Counter
 
 def main():
     global selected_region, success_counter, failure_counter, disk_size
@@ -765,7 +819,7 @@ def main():
     # 确认开始
     confirm = input("\n确认继续? (y/n，默认y): ").strip().lower() or "y"
     if confirm != 'y':
-        print("操作已取消")
+        print("操作已取消 excelled")
         return
     logger.info(f"硬盘大小设置为: {disk_size}GB")
 
@@ -787,52 +841,24 @@ def main():
 
     for idx, (ak, sk) in enumerate(key_pairs, 1):
         display_key = format_access_key(ak)
-        key_start_time = time.time()  # 记录每个密钥的开始时间
-        proxy_retries = 0
-        max_proxy_retries = 3
-        success = False
-        proxy_ip = "未知"
+        key_start_time = time.time()
 
-        while proxy_retries < max_proxy_retries and not success:
-            sys.stdout.write(f"\r[第{idx}个] {display_key} - 正在获取代理 (尝试 {proxy_retries + 1}/{max_proxy_retries})...")
-            sys.stdout.flush()
-            proxy_url, country = fetch_proxy_from_country()
+        sys.stdout.write(f"\r[第{idx}个] {display_key} - 处理中...")
+        sys.stdout.flush()
 
-            sys.stdout.write(f"\r[第{idx}个] {display_key} - 测试代理 {country} (尝试 {proxy_retries + 1}/{max_proxy_retries})...")
-            sys.stdout.flush()
-            user_agent = get_random_user_agent()
-            proxy_ok, proxy_msg = test_proxy_connection(proxy_url, user_agent)
+        # 重置代理状态并获取新代理
+        logger.info(f"{display_key} = 开始处理，初始化新代理")
+        success, proxy_ip = process_account(ak, sk)
+        key_end_time = time.time()
+        processing_time = key_end_time - key_start_time
 
-            if not proxy_ok:
-                sys.stdout.write(f"\r[第{idx}个] {display_key} - 代理失败 ❌ ({proxy_msg})")
-                sys.stdout.flush()
-                proxy_retries += 1
-                if proxy_retries < max_proxy_retries:
-                    logger.info(f"{display_key} = 代理失败，准备第 {proxy_retries + 1} 次重试")
-                    time.sleep(random.uniform(5, 10))
-                continue
-
-            sys.stdout.write(f"\r[第{idx}个] {display_key} - 启动实例中...")
-            sys.stdout.flush()
-
-            success, proxy_ip = process_account(ak, sk)  # 使用process_account处理重试逻辑
-            key_end_time = time.time()
-            processing_time = key_end_time - key_start_time
-
-            if success:
-                sys.stdout.write(f"\r[第{idx}个] {display_key} - 启动成功 ✅\n")
-                rows.append([display_key, "成功", proxy_ip, f"{processing_time:.1f}s"])
-            else:
-                sys.stdout.write(f"\r[第{idx}个] {display_key} - 启动失败 ❌\n")
-                rows.append([display_key, "失败", proxy_ip, f"{processing_time:.1f}s"])
-            sys.stdout.flush()
-
-        # 如果代理重试达到最大次数仍失败，记录失败
-        if not success:
-            sys.stdout.write(f"\r[第{idx}个] {display_key} - 代理重试达到最大次数，启动失败 ❌\n")
-            rows.append([display_key, "失败", proxy_ip, f"{time.time() - key_start_time:.1f}s"])
-            with counter_lock:
-                failure_counter += 1
+        if success:
+            sys.stdout.write(f"\r[第{idx}个] {display_key} - 启动成功 ✅\n")
+            rows.append([display_key, "成功", proxy_ip, f"{processing_time:.1f}s"])
+        else:
+            sys.stdout.write(f"\r[第{idx}个] {display_key} - 启动失败 ❌\n")
+            rows.append([display_key, "失败", proxy_ip, f"{processing_time:.1f}s"])
+        sys.stdout.flush()
 
         # 每个密钥处理完成后随机延迟
         if idx < len(key_pairs):
